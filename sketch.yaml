@@ -1,0 +1,25 @@
+# Pin record for USB_Serial_Term / TinyUSB_Extras.
+#
+# Arduino IDE 2.x never reads this file, and arduino-cli refuses --library
+# together with --profile, so scripts/build.sh does not use --profile either:
+# it passes --fqbn and --library explicitly. This file exists to record the
+# versions a build was verified against.
+#
+# Verified pins:
+#   - arduino:mbed_giga core 4.6.0 (FQBN arduino:mbed_giga:giga, DFU upload at
+#     0x08040000, 1966080 B app / 523624 B heap)
+#   - TinyUSB_Arduino 1.0.0 (~/TinyUSB_Arduino, union config as shipped:
+#     CFG_TUH_CDC + FTDI + PL2303 + CP210X + CH34X all 1)
+#
+# The IDE resolves the library from the sketchbook, not from here: run
+# scripts/install-library.sh once, or add the library through
+# Sketch > Include Library > Add .zip Library...
+
+profiles:
+  giga:
+    fqbn: arduino:mbed_giga:giga
+    platforms:
+      - platform: arduino:mbed_giga (4.6.0)
+    libraries:
+      - TinyUSB_Arduino (1.0.0)
+default_profile: giga
