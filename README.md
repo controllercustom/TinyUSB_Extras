@@ -79,16 +79,18 @@ Types: CDC, FTDI, PL2303, CP210x, CH34x
 ```
 
 Verified on hardware with an **FTDI FT232R** (`0403:6001`), a **CP2104**
-(`10c4:ea60`), a **PL2303** (`067b:2303`) and a **Pico 2** (`239a:cafd`,
-CDC-ACM): ASCII plus a binary burst containing `00 01 02 ff fe` went in and came
-back byte-for-byte through the adapter's jumpered TX→RX (46/46, 45/45 and
-43/43 bytes on three runs, plus 41/41 on the PL2303 with `11 13 18` included). A round-trip soak pushes
+(`10c4:ea60`), a **PL2303** (`067b:2303`), a **Pico 2** (`239a:cafd`, CDC-ACM)
+and a **CH340-based Mega 2560 clone** (`1a86:7523`): ASCII plus a binary burst
+containing `00 01 02 ff fe` went in and came back byte-for-byte through the
+adapter's jumpered TX→RX (46/46, 45/45 and 43/43 bytes on three runs, plus
+41/41 on the PL2303 with `11 13 18` included). A round-trip soak pushes
 100,000 pseudorandom bytes through and gets 100,000 back identical, all 256
-byte values, at 11.3–11.4 kB/s — the 115200 8N1 wire rate — on the CP2104, the
-PL2303, the FTDI and a CP2102 (200,000 bytes on both the FTDI and the CP2102,
-11.2 KiB/s). Hot-plug is verified on the CP2104 and on an FTDI: unplug, wait,
-replug and the port re-initialises itself and reports `ready` again without a
-board reset, with the device table identical to a cold mount.
+byte values, at 11.2–11.4 kB/s — the 115200 8N1 wire rate — on the CP2104, the
+PL2303, the FTDI, a CP2102 and the CH340 (200,000 bytes on both the FTDI and the
+CP2102, 11.2 KiB/s). Hot-plug is verified on the CP2104, on an FTDI and on the
+CH340: unplug, wait, replug and the port re-initialises itself and reports
+`ready` again without a board reset, with the device table identical to a cold
+mount.
 
 After `ready`, everything is transparent in both directions — including
 binary data. Unplug the device and `unmounted` is printed; replugging it
@@ -114,6 +116,8 @@ sending.
   the host stack's one-second VBUS settle. Expect `re-initialising USB-A host
   port for hot-plug` followed by `host stack up…` on the terminal, then
   `mounted` / `ready` when you plug the next one in. No board reset is needed.
+  Pull and replug inside about a second and the port never sees a disconnect at
+  all: the mount stays and the bridge keeps working off the old state.
 - **A CDC-ACM device that advertises no line-request capability never mounts.**
   Enumeration applies 115200 8N1 as part of mounting, and a device that refuses
   that request fails the mount. Most CDC devices (Arduino, RP2040/RP2350 native
@@ -129,28 +133,31 @@ sending.
   such limit: measured with a Pico 2 on the host port, 100 KB round-tripped in
   0.27 s and 200 KB in 0.53 s — about 365 KiB/s, roughly 32 times the UART
   chips.
-- **A device that buffers its own output can hold the last packet — this is a
-  zero-length-packet (ZLP) condition, and it is the device that omits it.** A
-  USB bulk transfer whose length is a whole number of packets cannot be told
-  apart from "more data coming" unless the sender ends it with a short or
-  empty packet. The GIGA does send one; the Pico 2's Arduino core did not, so
-  its 200,000-byte payload (3125 whole packets) came back exactly 64 bytes
-  short and uncorrupted, and one more byte released all 65. Nothing is lost
-  and a live terminal always has more traffic, but do not expect the final
-  packet of a closed stream.
-- **The mirror image happens too: a whole number of packets can gain one byte.**
-  With the CP2104, payloads of 64, 128 and 192 bytes came back complete plus
-  exactly one extra byte, while 63, 65, 130 and 193 came back exact. The extra
-  differs each run, so it is not a marker you can strip. The bridge is
-  byte-transparent — nothing is corrupted or reordered — but a consumer that
-  counts bytes can see one more than it sent.
-  This is the device, not the bridge: an FTDI at those same sizes, and a
-  200,000-byte run through it, came back exact, and so did a CP2102. End-of-
-  stream behaviour varies by chip, not by family: measured so far, both FTDI
-  variants and the CP2102 exact, the CP2104 one byte extra, the Pico 2 64
-  bytes held back. The CP2102 and the CP2104 report the same VID and product
-  ID, so the difference is the chip's firmware and is not visible in anything
-  the sketch can read.
+- **A payload whose packet count is a whole number of packets can read back
+  short by one packet — and the missing packet is on the wire.** A USB bulk
+  transfer whose length is a whole number of packets cannot be told apart from
+  "more data coming" unless the sender ends it with a short or empty packet, so
+  *something* owes a terminator. Measured on the wire, the reader that owes it
+  on this bench is the PC's kernel `cdc_acm`: it arms 128-byte IN URBs (twice
+  the GIGA's 64-byte bulk IN) and delivers only on URB completion, so an odd
+  packet count leaves one packet sitting in an open URB until the next write
+  releases it. The sketch works around it at the source — `writeTerminal()`
+  splits any batch that is a whole multiple of the terminal's 64-byte packet
+  into n−1 + 1, so the burst ends on a short IN packet and the kernel's URB
+  terminates on it. With that in place the shortfall is no longer observable: a
+  Pico 2 on the host port returns 16/16 exact across 1..16 whole packets.
+- **The mirror image: a whole number of packets can gain one byte.** With the
+  CP2104, payloads of 64, 128 and 192 bytes came back complete plus exactly one
+  extra byte, while 63, 65, 130 and 193 came back exact. The extra differs each
+  run, so it is not a marker you can strip — the chip is answering the GIGA's
+  zero-length OUT write with a byte of its own buffer. Fixed in the library:
+  `CFG_TUH_CDC_CP210X_SUPPRESS_ZLP` (default on) skips that ZLP for the CP210x
+  driver only, and after it the CP2104 is exact at every size.
+  End-of-stream behaviour varies by chip, not by family: measured so far, both
+  FTDI variants, the CP2102 and the CH340 exact, the CP2104 one byte extra.
+  The CP2102 and the CP2104 report the same VID and product ID, so the
+  difference is the chip's firmware and is not visible in anything the sketch
+  can read.
 - **The GIGA's own USB-C line coding stays at its default** 9600 8N1 until a
   host asks otherwise. `Serial.begin(115200)` cannot change it (on the CDC
   transport the call is a no-op), and on a CDC link the baud value is advisory
@@ -159,12 +166,11 @@ sending.
 - **The library's own `[TUH]` start-up chatter goes to `Serial1`** (D0 / D1),
   not to the USB-C terminal. Wire a UART bridge there if you want the host
   stack's init sequence; the sketch's own `[term]` lines are all on USB-C.
-- **Four of the five host types have been run on real hardware** — FTDI,
-  CP210x, PL2303 and CDC-ACM (a Pico 2). Only CH34x is left unobserved: no
-  CH340-class adapter was available on this bench, so its behaviour is read off
-  the code and none of it is measured. A CDC-ACM device reports the type as
-  `CDC` rather than a vendor name, since its VID is not one of the four vendor
-  lists.
+- **All five host types have now been run on real hardware** — FTDI,
+  CP210x, PL2303, CDC-ACM (a Pico 2) and CH34x (a CH340-based Mega 2560 clone,
+  `1a86:7523`, running `tests/Mega2560_CH340_Echo`). A CDC-ACM device reports
+  the type as `CDC` rather than a vendor name, since its VID is not one of the
+  four vendor lists.
 
 ## Maintainer commands (arduino-cli)
 
@@ -175,6 +181,12 @@ scripts/upload.sh /dev/ttyACM0  # compile + DFU upload (needs a running app to t
 scripts/upload-swd.sh           # flash over an ST-Link / STLINK-V3 on J10 (SWD)
 scripts/monitor.sh              # 115200 8N1 monitor on the USB-C port
 scripts/soak.py                 # 100 KB round-trip integrity test (adapter TX-RX shorted)
+scripts/cdc64-sweep.py          # byte-exact sweep at the 64-byte boundary
+scripts/mps-tail-probe.py       # per-size verdict at the boundary: exact / held tail / +k
+scripts/hold-probe.py           # one payload, nothing else for N s: withheld vs late vs lost
+
+tests/Pico2_CDC_Echo/           # CDC-ACM device on the host port (flash-swd.sh loads it)
+tests/Mega2560_CH340_Echo/      # CH34x device on the host port (upload.sh: -cwiring)
 ```
 
 `scripts/build.sh` passes `--library` explicitly so it also works without the
@@ -182,7 +194,7 @@ sketchbook install. It uses the same FQBN, the same default configuration and
 no extra flags, and produces the same image as the IDE:
 
 ```
-Sketch uses  164288 bytes (8%) of program storage space. Maximum is 1966080.
+Sketch uses  164352 bytes (8%) of program storage space. Maximum is 1966080.
 Global variables use 70176 bytes (13%) of dynamic memory.  Maximum is 523624.
 ```
 
