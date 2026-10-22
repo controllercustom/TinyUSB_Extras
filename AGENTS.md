@@ -32,7 +32,7 @@ Measured, and identical for `arduino-cli --library` and `arduino-cli` with the
 sketchbook symlink (the IDE path):
 
 ```
-Sketch uses          164288 bytes (8%)  of 1966080
+Sketch uses          164352 bytes (8%)  of 1966080
 Global variables use  70176 bytes (13%) of 523624
 ```
 
@@ -252,71 +252,78 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   11.3–11.4 kB/s. A CDC-ACM device has no baud limit and runs far above that:
   a Pico 2 round-tripped 100 KB in 0.27 s and 200,001 bytes in 0.53 s, so
   ~365–371 KiB/s, about 32x the UART-bridge chips.
-- **The far device may be holding the last packet — it is a ZLP condition, and
-  it is the device's side that is short of one.** With that same Pico 2, a
-  200,000-byte payload (3125 whole MPS packets) came back exactly 64 bytes short
-  with zero mismatches, and one more byte released all 65. A bulk transfer whose
-  length is a multiple of MPS is indistinguishable from "more coming" unless the
-  producer ends it with a short or zero-length packet, so *something* owes a ZLP.
-  The GIGA already does, on both sides:
-  `cdc_host.c:683-686` calls `tu_edpt_stream_write_zlp_if_needed` after a
-  completed TX transfer, and `tusb.c:376-383` gates it on exactly that
-  condition (`last_xferred_bytes > 0 && 0 == (last_xferred_bytes & (mps-1))`)
-  and issues `stream_xfer(s, 0)`. On the read side `cdc_host.c:729` opens every
-  stream with `xfer_len = tu_edpt_packet_size(desc_ep)`, so
+- **A payload whose packet count is a whole number of MPS packets reads back
+  short by one packet — and the missing packet is on the wire.** With a Pico 2
+  on the host port, 200,000 bytes (3125 whole MPS packets) came back exactly 64
+  bytes short with zero mismatches, and one more byte released all 65. A bulk
+  transfer whose length is a multiple of MPS is indistinguishable from "more
+  coming" unless the producer ends it with a short or zero-length packet, so
+  *something* owes a terminator. **The reader that owes it on this bench is the
+  PC's kernel `cdc_acm`, not the bridge** — settled below. The GIGA's USB-A host
+  stack already terminates both ways: `cdc_host.c:683-686` calls
+  `tu_edpt_stream_write_zlp_if_needed` after a completed TX transfer, gated in
+  `tusb.c:376-383` on `last_xferred_bytes > 0 && 0 == (last_xferred_bytes & (mps-1))`
+  and issuing `stream_xfer(s, 0)`, and on the read side `cdc_host.c:729` opens
+  every stream with `xfer_len = tu_edpt_packet_size(desc_ep)`, so
   `tu_edpt_stream_read_xfer` asks for `min(available & ~63, 64)` — one packet
-  per URB — and a bulk IN transfer of exactly MPS completes on the full packet.
-  The GIGA therefore never holds a tail waiting for a short packet; the bytes
-  are sitting in the Pico's own core, which is the producer that never sent the
-  ZLP. The application cannot send one either: `tu_edpt_stream_write` opens with
-  `TU_VERIFY(bufsize > 0)`, so `tuh_cdc_write(idx, buf, 0)` is a no-op. Not a
-  bridge fault — a live terminal always has more traffic. `scripts/soak.py`
-  reports it as INCOMPLETE (exit 2) and prints no rate, since the wait time
-  says nothing.
-  **Refined root cause (measured, this session).** The loss is the GIGA's host
-  IN path, not the Pico holding a tail. Instrumented Pico counters read
-  `rxTotal = txTotal = 64` for a 64-byte payload while the GIGA captured 0 —
-  the Pico armed and *released* its IN URB (transfer completed on the wire),
-  so the GIGA never received it. The host arms exactly-MPS IN URBs
-  (`open_ep_stream_pair`, `cdc_host.c:729`) and `handle_channel_irq`
-  de-allocates the channel (`hcd_dwc2.c:1644`) at each completion, then the
-  class re-arms later in the poll (`tu_edpt_stream_read_xfer`, `cdc_host.c:706`).
-  The echo loop flushes per 64-byte chunk, so the device sends `[64][ZLP][64][ZLP]…`
-  (ZLP after *every* packet) and the host must re-arm after every packet; the
-  device's next IN packet lands in the de-alloc->re-arm window and is NAKed.
-  Two bounded fixes were tried and both measured NO change: (a) retaining the
-  un-armed packet in `handle_rxflvl_irq` — `_hcd_rx_pending_len` stayed 0, the
-  packet never reaches the RX FIFO (it is NAKed, not discarded); (b) multi-packet
-  IN URBs (RX_EPSIZE 64->512) — unchanged, because the device's per-packet ZLP
-  ends each URB after one packet regardless of URB size. The only correct fix is
-  a genuinely continuous (double-buffered) armed IN buffer: re-arm the IN channel
-  inside the ISR before `channel_dealloc`, staging the completed bytes into a
-  class-owned scratch the class drains via a getter. That is a redesign of the
-  host IN stream layer (the generic `tu_edpt_stream` owns arming; an ISR re-arm
-  breaks that invariant) and cannot be regression-tested for FTDI/CP210x/CH34x/
-  PL2303 on this bench, so it was NOT landed in the shared library. Left as a
-  known artifact; `soak.py` still reports INCOMPLETE.
-  **Corrected by the wire (Cynthion capture, this session).** An inline Cynthion
-  analyzer between the two ends captures raw TLPs — the level usbmon cannot
-  reach — and it says the loss is not on the wire:
-  - Every IN DATA packet is acknowledged. In both captures each IN DATA is
-    followed by a 1-byte ACK (`0xd2`) from the host. Nothing at the payload
-    boundary is NAKed, so the de-alloc->re-arm NAK above is not what the wire
-    shows.
-  - The producer does send ZLPs. `DATA0` frames with `Data: <none>` arrive on
-    the IN endpoint, one per echo flush, and the GIGA receives and ACKs them.
-    The "producer that never sent the ZLP" above is wrong.
-  - The retry traffic is on the OUT side, not the IN. The 192-byte capture
-    transmits the same URB twice (frames `253214` and `253217`, identical
-    payload, same DATA parity) — the Pico refusing an OUT packet while its own
-    ring is full and the GIGA retrying. Benign: the payload lands once.
-  - Ring-full is not the explanation either. `cdch_data` is `0x850` = 2128 B in
-    the linked .elf (RX/TX 1024 each, `tusb_config_common.h:134-135` under
-    `ARDUINO_TINYUSB_BOARD_GIGA`, which `board_auto.h:56` defines). A 192-byte
-    payload fits with 832 bytes spare, yet 64 never reached the application.
-  So the −64 is downstream of the endpoint: the bytes are accepted and
-  acknowledged, then do not all surface. Next suspect is the CDC class's read
-  accounting around the ZLPs, not DWC2 channel arming.
+  per URB — and a bulk IN of exactly MPS completes on the full packet. The
+  application cannot send a ZLP either: `tu_edpt_stream_write` opens with
+  `TU_VERIFY(bufsize > 0)`, so `tuh_cdc_write(idx, buf, 0)` is a no-op.
+  `scripts/soak.py` reports the shortfall as INCOMPLETE (exit 2) and prints no
+  rate, since the wait time says nothing.
+  **Settled by the wire, on the terminal side (Cynthion, this session).** An
+  inline analyzer on the GIGA's USB-C link — between the board and this PC —
+  captures raw TLPs at a level usbmon cannot reach. Two captures, one 192-byte
+  payload each, decoded with the pcap record timestamps (`scripts/cynthion-seq.py`
+  prints frame numbers, which are not time; `/tmp/opencode/seq-times.py` adds
+  the record times):
+
+  | capture | OUT PC→GIGA | IN GIGA→PC | what the tty read |
+  |---|---|---|---|
+  | `giga_linux.pcap`, host-TX ZLP on | 3 × 64 B at 0.000003 / 0.000068 / 0.000133 s | 3 × 64 B at 6.298 / 12.280 / **17.274** ms, digests matching the OUT packets, then **1 B `08` at 17.340 ms** | **193 of 192** in 0.32 s, release returned 1 |
+  | `giga_linux-b.pcap`, host-TX ZLP off | 3 × 64 B at 0.000003 / 0.000068 / 0.000133 s | 3 × 64 B at 6.325 / 12.326 / **17.281** ms, digests matching | **128 of 192** in 0.31 s, then **65** after the release byte |
+
+  Every IN DATA is followed by a `0xd2` ACK from the PC, so the third packet
+  crossed GIGA→PC and was acknowledged at 17.3 ms — 295 ms before the release
+  byte was even written. Nothing is lost and nothing is late: the last packet
+  is **withheld by the reader**.
+
+  **The mechanism, from kernel source** (`drivers/usb/class/cdc-acm.c`, torvalds/
+  linux master). `:1388-1389` sets `readsize = usb_endpoint_maxp(epread) *
+  (quirks == SINGLE_RX_URB ? 1 : 2)` — **128 bytes** for the GIGA's 64-byte
+  bulk IN — and `:1413` sets `acm->rx_buflimit = num_rx_buf`. The kernel arms
+  2-packet IN URBs, and a bulk IN packet of exactly MPS does not terminate a
+  URB: `acm_read_bulk_callback` (`:515`) delivers only on URB completion —
+  `acm_process_read_urb` (`:530`) does `tty_insert_flip_string` +
+  `tty_flip_buffer_push` — and re-arms at `:585`. So 192 B = URB A (packets
+  1+2, full, completes at 12.3 ms) + URB B (one packet, still open). The
+  parity rule is exactly `readsize / MPS = 2`: odd packet counts leave one
+  packet in an open URB, even counts fill them. A short IN packet terminates
+  it, which is why the ZLP-on run delivered everything — the CP2104's spurious
+  byte is itself an extra IN transfer, 1 byte at 17.340 ms. Mbed's USBCDC
+  sends whole 64-byte IN packets and never a terminating short/ZLP packet of
+  its own, which is why the open URB exists at all.
+
+  **Everything upstream of the PC is exonerated, in order.** The host stack
+  received and acknowledged every packet: in the host-side capture (`cp2104-
+  zlp-a.pcap`) each IN DATA is followed by a `0xd2` ACK, the retry traffic is
+  on the OUT side (frames `253214` and `253217`, identical payload and parity
+  — the chip refusing an OUT packet while its own ring is full, benign), and
+  ring-full is not it either: `cdch_data` is `0x850` = 2128 B in the linked
+  .elf (RX/TX 1024 each, `tusb_config_common.h:134-135` under
+  `ARDUINO_TINYUSB_BOARD_GIGA`, which `board_auto.h:56` defines), so a 192-byte
+  payload fits with 832 bytes spare. The CDC host class delivered all 192: a
+  delivery log compiled into `cdch_xfer_cb`'s IN branch counts `64 64 64 0`
+  per payload, `cdch_rx_bytes` accounts for every byte, and
+  `cdch_data[0].stream.rx.ff` shows `wr_idx == rd_idx`. Neither staging buffer
+  is a discriminator — `cdch_epbuf.rx` and `_SerialUSB._tx_buffer` both keep
+  the last packet after delivery, so "it is still there" says nothing. The
+  terminal put all 192 on the wire inside 17.3 ms, so Mbed's USBCDC
+  (`USBCDC.cpp:375-405`, `send_nb` / `_send_isr_start`) is exonerated too.
+  The live USBCDC is `_SerialUSB` (0x24007350); `_UART_USB_` (0x24006c84) is a
+  second, unused instance that reads all zero, which is why the earlier member
+  reads failed. There is nothing to fix in the class's read accounting, and no
+  class-side fix can move bytes the class already handed to `Serial.write`.
   Capture facts, all measured: nanosecond pcap (magic `4d3cb2a1`), link type
   usbll, payload = frame[1:-2] — the analyzer omits the 2-byte endpoint header
   on DATA TLPs, so Wireshark's `Data` field is the payload and `usbll.data` is
@@ -325,31 +332,33 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   over 11.4 s. tshark refuses a capture it cannot traverse to: `~/mydocs` is
   755 but `~` is 750, so even a 664 file under it is rejected — copy to
   `/tmp/opencode` and `chmod 644`. `scripts/cynthion-seq.py` decodes it.
-  **The −64 is the GIGA's host-IN path, not the Pico.** The same Pico 2
-  (`239a:cafd`, Adafruit CDC Echo) plugged straight into this Linux PC — kernel
-  `cdc_acm` on `/dev/ttyACM3`, echo internal, no serial short — came back exact
-  across the exact-multiple-of-64 sweep (64/128/192/256/320/384/448/512, plus
-  4096 and 16384, and 64/128/192 repeated x2), no missing tail. The kernel
-  `cdc_acm` read keeps the IN endpoint armed continuously, so there is no
-  de-alloc→re-arm window to NAK a packet — the −64 is the GIGA's DWC2 host-IN
-  URB churn, not a property of the Pico. (Separately, a 65536- and 200000-byte
-  burst blocks on the kernel *write*: the Pico's CDC echo buffer can't absorb a
-  64 KB burst at once, and the PC — unlike the GIGA's paced host-TX FIFO —
-  applies backpressure. That is a PC-side buffer limit, not the tail loss.)
-  **Not the device library either.** The Pico 2 was rebuilt on TinyUSB_Arduino
-  device mode (`tests/Pico2_CDC_Echo`, VID `2341` PID `8001`, bulk OUT `0x02` /
-  bulk IN `0x83`, MPS 64 — read off the config descriptor the kernel cached, and
+  **The Pico was never the variable, in either direction.** Plugged straight
+  into this Linux PC — kernel `cdc_acm` on `/dev/ttyACM3`, echo internal, no
+  serial short — the same Pico 2 (`239a:cafd`, Adafruit CDC Echo) came back
+  exact across the exact-multiple-of-64 sweep (64/128/192/256/320/384/448/512,
+  plus 4096 and 16384, and 64/128/192 repeated x2), no missing tail. It is
+  exact because its own CDC device stack ends *every* packet with a ZLP
+  (`[64][ZLP][64][ZLP]…`), so no kernel URB is ever left open — that is the
+  discriminator, not the device's identity. Rebuilt on TinyUSB_Arduino device
+  mode (`tests/Pico2_CDC_Echo`, VID `2341` PID `8001`, bulk OUT `0x02` / bulk
+  IN `0x83`, MPS 64 — read off the config descriptor the kernel cached, and
   `lsusb` went `239a:cafd` -> `2341:8001`, so the kernel re-read the new
-  endpoints rather than reusing a stale layout). The −64 signature is unchanged.
-  Swapping Adafruit TinyUSB for TinyUSB_Arduino on the device changes nothing,
-  which is what makes the device side an eliminated variable, not a suspect.
-  **The discriminator is packet parity, not "a whole number of packets".** One
+  endpoints rather than reusing a stale layout), the −64 signature is unchanged
+  with the Pico on the GIGA's host port: swapping Adafruit TinyUSB for
+  TinyUSB_Arduino on the device changes nothing, which is what makes the device
+  side an eliminated variable, not a suspect. (Separately, a 65536- and
+  200000-byte burst blocks on the kernel *write*: the Pico's CDC echo buffer
+  can't absorb a 64 KB burst at once, and the PC — unlike the GIGA's paced
+  host-TX FIFO — applies backpressure. That is a PC-side buffer limit, not the
+  tail loss.)
+  **The discriminator is packet parity, and the period is the kernel's.** One
   clean run at 1..16 packets: every ODD packet count comes back exactly 64 bytes
   short, every EVEN count is byte-exact (125–304 KiB/s on the exact ones, so no
-  baud limit is involved), reproduced across three independent runs. The wording
-  above is too broad: 200,000 bytes = 3125 packets (odd) lost its tail, while
-  100,000 bytes ends in a partial packet and comes back whole. Half of the
-  MPS-multiple payloads are fine.
+  baud limit is involved), reproduced across three independent runs. The period
+  is `readsize / MPS = 2` from `cdc-acm.c:1388-1389`, not a device property.
+  The earlier wording is too broad: 200,000 bytes = 3125 packets (odd) lost its
+  tail, while 100,000 bytes ends in a partial packet and comes back whole. Half
+  of the MPS-multiple payloads are fine.
   **A plain sweep cannot see this.** A held tail is released by the *next* write,
   so it lands in the following size's read and shows up as extra bytes or a
   mismatch at index 0 — measured: `65 -> 129 back`, `256 -> corrupted at index 0
@@ -364,6 +373,13 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   transmitted). A 32 KB burst also wedged the host stack once the writer was
   killed mid-block; only a SWD reset cleared it, twice in this session. Keep
   boundary sweeps at or under 1 KB and the large sizes in their own run.
+  The ring size is checkable: `CFG_TUD_CDC_RX_BUFSIZE` and
+  `CFG_TUD_CDC_TX_BUFSIZE` are 256 each (`tusb_config_union.h:168-169`), so a
+  100 KB soak is ~400x the ring and is not a volume test for this device at
+  all. Measured with the split landed: 99936 of 100000 back, 542 mismatches
+  from index 99392, tail never arrived — and the bridge was still alive
+  afterwards (64 and 128 exact), so this occurrence did not wedge the host
+  stack.
   **usbmon cannot show this at packet level.** `tcpdump -i usbmon3` reports per
   URB, not per packet: a 128-byte IN read arrives as ONE complete frame of 128
   bytes, so the capture proves the kernel arms IN continuously (16 pending
@@ -383,17 +399,40 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   no ZLP is issued there. The application cannot suppress it — the ZLP is the
   library's decision. Byte-transparent, but not byte-exact: a consumer that
   counts bytes will see COUNT+1.
+  **Fixed in the library, landed.** `tusb_option.h` gained
+  `CFG_TUH_CDC_CP210X_SUPPRESS_ZLP`, default **1**, and `cdc_host.c:686` gates
+  the call on `p_cdc->serial_drid != SERIAL_DRIVER_CP210X`, wrapped in
+  `#if CFG_TUH_CDC_CP210X && CFG_TUH_CDC_CP210X_SUPPRESS_ZLP` so the enum name
+  is not referenced when the driver is compiled out. No per-instance state is
+  needed: every driver sets `serial_drid` in its own `*_open()` (`:1025` ACM,
+  `:1221` FTDI, `:1609` CP210X, `:1781` CH34X, `:2118` PL2303), so a hot-plug
+  cannot carry a stale value — which matters because
+  `cdch_close_interface` (`:659-668`) resets only `daddr`, `bInterfaceNumber`
+  and `mounted`. The tell is in the disassembly, not the size report — both
+  builds are 164288 bytes — `cdch_xfer_cb` does `ldrb r3,[r4,#5]`, `cmp r3,#2`,
+  `beq` past the call, and `bl <tu_edpt_stream_write_zlp_if_needed>` for every
+  other driver. Measured after the change on the CP2104: 63/65/128/130/193
+  exact, 64 and 192 `held tail` with missing = 64, and **no spurious byte at
+  any size**.
   **Not a bridge property.** The same sweep on an FTDI FT232R — 64, 128 and 192
   bytes, plus a 200,000-byte soak at 11.2 KiB/s — came back exact, so the
-  injection is that chip's reaction to the ZLP. At this one boundary the three
+  injection is that chip's reaction to the ZLP. At this one boundary the four
   devices measured so far do three different things: FTDI exact, CP2104 +1
-  spurious byte, Pico 2 −64 (tail held). Judge a new device, not the bridge.
+  spurious byte, Pico 2 −64 (tail held), CH340 `1a86:7523` exact. Judge a new
+  device, not the bridge.
   **Not family-wide, and not identity-driven**: a CP2102 reporting the *same*
   `10c4:ea60` — it differs only in `bcdUSB 0x0110` against the CP2104's
   `0x0200` — came back exact across the 63/64/65/128/130/192/193 sweep and a
   200,000-byte soak at 11.2 KiB/s. Two chips under one identity, two
   behaviours, so the quirk follows the chip's firmware rather than its
   advertised identity.
+  Re-measured with the split landed: bcdUSB `0x0110` and VID `10c4` PID
+  `ea60` over an unhalted read, `serial_drid = 2` so the driver-scoped
+  suppression binds for it as well, 7/7 exact across the same sweep, and
+  200000/200000 byte-identical in 17.47 s at 11.2 KiB/s against the 17.46 s
+  baseline above. Not a discriminating run — this chip was exact before the
+  change too — but it is the regression that keeps the CP210x driver working
+  for a second chip under the same identity.
   **Not the chip at all — the GIGA's host-TX ZLP is what triggers it.** The same
   CP2102 (`10c4:ea60`, `bcdDevice 0x0100`) plugged straight into this Linux PC —
   handled by the kernel `cp210x` usbserial converter on `/dev/ttyUSB1`, its
@@ -441,6 +480,164 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   UART has no notion of a transfer boundary — the next write simply
   continues the same transfer. The +1 is the CP2104's bug in answering a
   legitimate ZLP, not a difference in the bytes either side sends.
+  **Removing the ZLP does remove the +1, and costs a worse fault (measured,
+  this session).** One A/B on the CP2104 — same chip, same tools, one library
+  line commented out at `cdc_host.c:686`, reflashed. It is the only host-TX
+  ZLP site: `tuh_cdc_write_flush` (`cdc_host.c:463-467`) goes through
+  `tu_edpt_stream_write_xfer`, which never issues one, and the compiled
+  `cdch_xfer_cb` was the tell — the TX branch ended at
+  `tu_edpt_stream_write_xfer` with no ZLP call, while the symbol stayed in the
+  .elf because other classes still reference it, so the size report (164288
+  both ways) says nothing. ZLP off: no extra byte in any of the 22 transfers,
+  and instead 64 and 192 (plus 448 in the wider sweep) come back 64 short and
+  arrive only once one more byte is written — `mps-tail-probe.py` calls that a
+  held tail, and a 64-byte message returns *nothing at all* until then. ZLP
+  on, same session: the recorded +1 again at 64, 128, 192, 320, 384 and 448
+  (`ad d9 8d 4f 52 f0`), exact at 256, 512, 4096 and 16384 — so the +1 is not
+  at every MPS multiple, only at 1, 2, 3, 5, 6 and 7 packets. One stale byte
+  from the chip versus a whole packet of user data withheld until the next
+  keystroke — and the withheld packet is the PC's `cdc_acm` URB, settled above:
+  the disable does not break the bridge, it removes the extra IN transfer that
+  happened to terminate that URB. The swap is still strictly worse for a
+  terminal, so the global disable stayed out; what was landed instead is the
+  driver-scoped `CFG_TUH_CDC_CP210X_SUPPRESS_ZLP` above, which leaves the ZLP
+  intact for ACM, FTDI, CH34X and PL2303.
+  **The held tail is a parity rule, and it is the kernel's, not the device's.**
+  Re-measured on the CP2104 with the host ZLP off, one clean `mps-tail-probe.py`
+  pass per packet count from 1 to 15 (64..960, all under the 1 KB limit): every
+  ODD count comes back exactly 64 short and arrives once one more byte is
+  written, every EVEN count is byte-exact — the period is the PC's
+  `readsize / MPS = 2`. Same signature the Pico 2 showed with the ZLP *on*, so
+  parity is not a device property and the Pico was never the variable in it.
+  The ZLP-on table for this chip is a different period: +1 at 1, 2, 3, 5, 6, 7
+  packets and exact at 4, 8, 64 and 256 — bad unless the packet count is a
+  multiple of 4. Two periods, one chip, one config line: the odd-one is the
+  reader's URB, the period-4 one is the chip's answer to the ZLP. The set is
+  not stable across runs: a stock-build re-run of the same probe after the
+  reflash gave +1 at 1, 2, 3 and 4 packets, so treat the packet counts as
+  measured noise and the +1 itself as the fact. `mps-tail-probe.py` now reports
+  that as `whole + 1 spurious`; before the fix it called it `lost / not
+  recoverable` with `missing = -1`, which is a size the probe never
+  anticipated, not a loss.
+  The device2host disable (`cdc_device.c:501`) cannot help a UART-bridge chip
+  at all: that call belongs to TinyUSB's own CDC *device* stack, and the chip's
+  IN bytes are its firmware, so with both CDC ZLPs off the CP2104 measured the
+  host-off table unchanged. Bench state at the time of that run: both `TEMP`
+  disables in the library, the GIGA flashed with the host-off build, the Pico
+  device built with the device-off build but not loaded — the Pico test is
+  still open.
+  **Neither URB shape is the variable, and the tail is not late — it is
+  withheld by the PC.** Two more `TEMP` edits on the same chip, both inert:
+  `CFG_TUH_CDC_RX_EPSIZE` 64→512 (multi-packet IN URBs) and `CFG_TUH_CDC_TX_EPSIZE`
+  64→256 (OUT URBs the size the kernel's cp210x path submits, `port->bulk_out_size`).
+  Verified live — `cdch_epbuf` grew 0x88→0x248→0x308 and globals moved
+  70176→70624→70816 — and both runs returned the host-off table byte for byte.
+  They are inert because the cause is downstream of both: the GIGA's own IN
+  URBs are one packet each (`cdc_host.c:729`), so reshaping them cannot change
+  what the PC's 128-byte URB does with the bytes it is handed.
+  `scripts/hold-probe.py` settles the direction: one payload, nothing else
+  written for 20 s, and the last 64 bytes never arrive at all. A late packet
+  would show up; a withheld one cannot.
+  **The chip is not the side that requires a terminator, either.** The same
+  CP2104 plugged straight into this Linux PC — kernel `cp210x` on `/dev/ttyUSB1`,
+  TX jumpered back to RX, 115200 8N1 — came back byte-exact at 63/64/65/128/130/192/193
+  and at 256, 320, 384, 448, 512 and 4096: no spurious byte, no held tail, and
+  `hold-probe.py` returned 64 and 192 whole with nothing else written for 20 s.
+  The chip emits a whole-packet tail without any terminator, and the kernel
+  neither sends one nor waits for one. So the withheld tail is neither the chip
+  nor the GIGA's host-IN path — it is the PC's `cdc_acm` URB, which is the
+  conclusion the Pico run already reached, reached again from this side. The
+  16 KB size on the PC is a pacing artifact (10421 back in 10.43 s, still
+  draining at the 10 s bound), not corruption; the 1 KB bench rule stands.
+  Bench state at the end of this session: the `TEMP` global disable was
+  reverted and replaced by the landed driver-scoped option, so the library is
+  clean of TEMP edits but is no longer ZLP-neutral for CP210x, and the flashed
+  build suppresses the ZLP for that driver — the +1 baseline no longer
+  reproduces, by design.
+  **The reader artifact is not cp210x-specific, and the FTDI exactness is an
+  alignment accident.** A second PL2303 plugged straight into this PC — kernel
+  usb-serial on `/dev/ttyUSB1`, TX jumpered back to RX — came back 7/7 exact
+  across 63/64/65/128/130/192/193: the usb-serial path neither invents a byte
+  nor holds a tail, so the held tail belongs to the `cdc_acm` path, and the
+  only device on that path is the GIGA's own terminal toward the PC. FTDI is
+  exact through the GIGA because its 2-byte status prefix is stripped inside
+  the driver (`cdc_host.c:691-699`), so a 64-byte chip packet carries 62 data
+  bytes and the terminal's IN packets are never 64-aligned — a short packet
+  appears mid-stream and terminates the kernel's URB. PL2303 and CH34X have
+  no status prefix, so they are predicted to show the held tail through the
+  GIGA at odd packet counts; PL2303 on the host port is unmeasured and CH34X
+  was never on the bench. **That prediction is wrong, and it is now measured.**
+  A PL2303 on the GIGA's host port came back 7/7 exact across 63/64/65/128/130/192/193
+  — no held tail, no spurious byte. The discriminator is therefore not the
+  status prefix and not the driver: it is whether the terminal's IN packets
+  happen to be whole-MPS, which follows the batch sizes the sketch writes to
+  `Serial`. Whole-MPS batches were measured for the CP2104 and the Pico 2, and
+  both show the held tail; FTDI's 62-data-byte packets and the PL2303 do not,
+  and both are exact. **The batching is now isolated, on the wire**
+  (`~/mydocs/giga_linux-c.pcap`, decoded with the pcap record times): one
+  192-byte PL2303 payload crossed the USB-C link as 3 whole 64-byte OUT
+  packets PC->GIGA at 0.000003/0.000069/0.000140 s and came back as **192 IN
+  packets of exactly 1 byte** GIGA->PC, 0.000522..0.017183 s, gaps median 86
+  us = the 115200 8N1 wire rate, every one followed by a `0xd2` ACK, and the
+  bytes concatenate to the OUT payload (`a8 99 5f e5 07 a2 7f fe` first,
+  matching the first OUT digest). The release byte is a separate burst 0.317 s
+  later, 1 byte out and 1 back, so nothing was held. The class therefore
+  delivers the PL2303 **one byte at a time** — its USB-Serial IN packets are
+  byte dribbles, not 64-byte packets — the sketch writes one byte per
+  `Serial.write`, and every terminal IN packet is short, so the kernel's
+  128-byte URB terminates on the first packet and no URB is ever left open.
+  That is why this chip is exact at every size. The discriminator is the
+  granularity of the class's delivery, which follows the chip's IN packet size
+  on the USB-A link: the CP2104 and the Pico 2 deliver whole 64-byte packets
+  and hold the tail, the PL2303 delivers 1 byte and does not. CH34X remains
+  unmeasured.
+  What the IN-side change actually moved, from the code rather than the wire:
+  TinyUSB delivers on URB *completion* — `cdch_xfer_cb` calls
+  `tu_edpt_stream_read_xfer_complete` only when the transfer callback fires —
+  so a 512-byte URB fed with 64-byte full-MPS packets never completes and
+  nothing is delivered. That explains an unchanged table without implicating the
+  chip, and it is why multi-packet IN URBs cannot be landed as-is: they trade a
+  lost packet for an undelivered one.
+- **The sketch never hands the terminal a whole-MPS batch, so the held tail
+  above is worked around at the source.** `writeTerminal()` splits a batch
+  whose length is a multiple of `TERMINAL_MPS` (64 — the core's
+  `CDC_MAX_PACKET_SIZE` for the USB-C OTG_FS port, `USBCDC.h:30-32`) into
+  n-1 + 1, so the burst ends on a short IN packet and the PC's URB terminates
+  on it. `Serial.flush()` between the halves is required, not cosmetic:
+  `send_nb` no-ops while `_tx_in_progress` (`USBCDC.cpp:377-393`), so without
+  it the tail byte can be appended to the still-open buffer and go out as one
+  whole-MPS packet. **Discriminated on the CP2104.** An earlier round of runs
+  was not: `cdch_data[0].serial_drid` read 4 = `SERIAL_DRIVER_PL2303` there,
+  and that chip was exact at every size before the change, so its 7/7 sweep
+  said nothing. With the CP2104 back on the port — identity confirmed by an
+  **unhalted** `mdh 0x240060dc` read through the MEM-AP, VID `10c4` PID `ea60`
+  bcdDevice `0100` flags `0x07`, no halt anywhere near the plug event — the
+  sweep returns 7/7 exact across 63/64/65/128/130/192/193, with 64 and 192
+  flipped from `held tail` to exact, which is the pass condition, and
+  `scripts/soak.py` returned 100000 of 100000 byte-identical in 8.71 s at
+  11.2 KiB/s, the baseline within noise — at 256-byte batches only whole-MPS
+  batches pay one extra 1-byte IN packet. **The CDC-ACM case is confirmed too:**
+  the Pico 2 running `tests/Pico2_CDC_Echo` (VID `2341` PID `8001`, flags `0x07`
+  read unhalted) returns 7/7 exact across the boundary sweep and **16/16 exact
+  across 1..16 whole packets** (64..1024) at 62-281 KiB/s, so the parity rule
+  that held on this device before the change — every odd count 64 short — is
+  gone. **The wire confirmation is measured
+  too** (`~/mydocs/giga_linux-d.pcap`, decoded with the pcap record times): the
+  OUT side is one 64-byte packet at 0.000003 s, ACKed at 0.000049 s, and the IN
+  side is **63 bytes at 0.006094 s then 1 byte at 0.006151 s** — the split
+  leaves as two transfers and the short one is first, so the PC's URB
+  terminates at 6.1 ms rather than waiting for a next write that never comes.
+  The release byte is a separate burst at 0.3058 s and echoes itself, so the
+  63 + 1 pair is not a held tail being pushed through. `Serial.flush()` between
+  the halves is sufficient. The root cause is unchanged: it is
+  still the PC's `cdc_acm` URB, and the split is a source-level workaround,
+  not a correction of it. **A split on the host side cannot do the same thing**
+  — `tu_edpt_stream_write` (`src/tusb.c:404-415`) buffers into a FIFO and
+  `tu_edpt_stream_write_xfer` sizes the transfer from FIFO occupancy
+  (`tu_fifo_read_n(&s->ff, s->ep_buf, s->xfer_len)`), so 63 + 1 still leaves
+  one 64-byte OUT transfer and still satisfies the ZLP predicate; the CP210x
+  `+1` stays a library-level concern, which is where
+  `CFG_TUH_CDC_CP210X_SUPPRESS_ZLP` is.
 - **A large interrupted write can leave the host stack stuck, and only a reset
   clears it.** A 200,000-byte soak whose Python writer was killed mid-block left
   the GIGA forwarding nothing at all afterwards: 128, 130, 256 and 258 bytes all
@@ -501,10 +698,88 @@ for hot-plug`, `host stack up…`, `CP210x mounted idx=0 vid=10c4 pid=ea60`,
   are rejected, and RTS/DTR are inverted (`cdc_host.c:1753-1758`). **Never
   observed on this bench** — no CH340-class adapter was available, so all of
   that is read off the code and none of it is measured.
+  **A CH340-class board is now on the bench**: a Mega 2560 clone, chip identity
+  `1a86:7523` (`bcdDevice 2.62`, `iProduct "USB2.0-Serial"`), running
+  `tests/Mega2560_CH340_Echo`. Measured from `lsusb -v`: `bInterfaceClass 0xFF`,
+  `bInterfaceSubClass 1`, `bInterfaceProtocol 2`, `bNumEndpoints = 3` with the
+  bulk pair FIRST (EP2 OUT `0x02` / EP2 IN `0x82`, both `wMaxPacketSize 0x0020`
+  = **32**, not 64) and an interrupt endpoint last (EP1 IN `0x81`) — exactly the
+  shape `ch34x_open` demands. `1a86:7523` is the third row of
+  `CFG_TUH_CDC_CH34X_VID_PID_LIST` (`tusb_option.h`), so the driver binds, and
+  the sketch's VID map prints `CH34x`. The chip's bulk MPS being 32 means the
+  host-TX ZLP boundary for this device is at 32-byte multiples, so a boundary
+  sweep has to include 31/32/33 as well as the 64-byte terminal boundary.
+  Uploading to it is measured: the clone's bootloader speaks **STK500 v2**, so
+  the programmer is `-cwiring` (the IDE's line), not `-cardduino` — `-cardduino`
+  read back `0x00` on all ten attempts. Flash write verified by reading it back
+  (`dump flash 0 64` matches the `.hex` first record `0c 94 83 00 0c 94 b4 00…`).
+  The PC-side tty loopback works but only at the chip's own rate: `picocom -b
+  115200 /dev/ttyUSB1` echoed everything, while the earlier raw probes at the
+  converter's default speed returned zero bytes — a baud artifact, not a dead
+  converter, and not a dead sketch. **Measured on the GIGA host port**: the chip
+  mounts and the bridge works. `scripts/mps-tail-probe.py /dev/ttyACM0 31 32 33
+  63 64 65 95 96 97 128 192 193` → **12/12 exact**, no held tail and no spurious
+  byte at any size; 32/64/96/128/192 are whole multiples of the chip's 32-byte
+  bulk MPS, so it is exact at both its own boundary and the terminal's 64.
+  `scripts/soak.py /dev/ttyACM0 100000` → PASS, 100000 of 100000 byte-for-byte
+  identical in 8.70 s = 11.2 KiB/s, the 115200 8N1 wire rate, and **256 distinct
+  byte values of 256** — so this chip's EEPROM has XON/XOFF off even though
+  `cdc_host.c:2287` leaves flow control uncleared; a different CH34x may still
+  eat `x`/`q`/`X`/`Q`, and the soak is what reports that.
+  **Hot-plug works, and the console lines are the odd part.** Two events,
+  measured through the state rather than the console. A **quick** unplug +
+  replug left the bridge live (40/40 byte-exact) and the slot untouched at flags
+  `0x0007` with VID `1a86` PID `7523` — no teardown at all. A **slow** unplug
+  (left out ~10 s) did tear down: the whole descriptor area at `_usbh_devices`
+  `0x240060dc` went to zero and `configStage` `4→0`, `hostReady` `1→0`, while
+  `GSNPSID` `0x40040040` stayed `0x4f54330a`, so the USB1 AHB clock stayed on.
+  Replugging restored the cold-mount state exactly — `0110 00ff 0800 1a86 7523
+  0262 0200 0100 0007`, `configStage = 4`, `hostIdx = 0`, `hostReady = 1` — and
+  the bridge echoed 40/40 again. So the CH34x hot-plug path is good: the
+  difference from the CP2104 is only that a replug inside the debounce window is
+  not seen as a disconnect at all.
+  **Across both events, zero `[term]` bytes reached the PC tty** — no
+  `unmounted`, no `re-initialising USB-A host port`, no `mounted`, no `ready`,
+  read with no input flush and an 8 s window right after the plug. The same
+  tty node delivers `loop()`-driven writes a moment later (the 40/40 echo), so
+  the node, the kernel `cdc_acm` read path and the terminal's TX are all alive.
+  The prints at `USB_Serial_Term.ino:444` (`tuh_cdc_mount_cb`) and `:474`
+  (`tuh_cdc_umount_cb`) are the ones missing, and both run inside the TinyUSB
+  host stack's callback rather than from `loop()`. Not chased to a cause: the
+  state machine demonstrably runs, the bytes demonstrably do not appear, and
+  the earlier CP2104 hot-plug on the same build printed the whole sequence, so
+  the open question is what the callback context does differently for this
+  chip, not whether the bridge works.
+- **Halting the app across a plug event strands the class's stream bookkeeping.**
+  Measured once: a chip was plugged while the target was halted for an OpenOCD
+  read, and after `resume` the port looked configured and healthy — `_usbh_devices`
+  flags `0x07`, `hostReady = 1`, `configStage = 4`, `portRecovering = 0` — with
+  both class FIFOs empty (`cdch_data[0].stream.{tx,rx}.ff` read `wr_idx == rd_idx
+  == 0`) and nothing round-tripping at any size; a SWD `reset run` cleared it.
+  Neither trigger reproduces it on its own: a chip swap with no SWD session
+  round-trips normally, and a halt/`resume` with the chip already mounted and
+  idle does too, both measured. The trigger is the halt spanning the plug event,
+  when the DWC2 phases advance and the class's `stream_claim` bookkeeping cannot
+  follow. End SWD inspections with `reset run`, not `resume` — which is what the
+  debugging recipe already says. **A `reset run` can leave the port dead on its
+  own**, measured: resetting while the chip stayed attached left flags `0x07`,
+  `hostReady = 1`, `configStage = CONFIG_DONE` and both class FIFOs empty, with
+  zero bytes at every size and no console chatter at all — the reset tears the
+  USB-C device port as well, so the PC's tty may need re-opening. A second
+  `reset run` restored the loopback. One dead port after a reset is not a
+  firmware fault.
 - **Stale build after touching the core or the library**: `rm -rf build/
   ~/.cache/arduino/`.
 - **Port busy on upload**: the monitor must be closed; the 1200 bps touch reset
   needs exclusive access. `fuser -k /dev/ttyACM0` if something else holds it.
+- **The ttyACM number is not stable**: the GIGA was ACM1, then ACM2, then ACM0
+  inside one session as other USB devices attached and detached, and a probe
+  aimed at the stale number fails with `FileNotFound` or, worse, silently
+  measures the STLINK. Resolve it by identity before every run:
+  `for p in /dev/ttyACM*; do udevadm info --query=property --property=ID_VENDOR_ID,ID_MODEL_ID "$p"; done`.
+  `2341:0266` is the GIGA running an app, `0483:374f` the STLINK-V3, `2e8a:000c`
+  the RPi Debug Probe — which exposes no ttyACM at all, so a missing node is not
+  a dead board; check `lsusb` for `2341:0266` before concluding anything.
 - **Board hangs after a bad sketch**: double-tap RESET → DFU (`2341:0366`),
   then `arduino-cli upload` again; BOOT0 + RESET forces the STM32 system
   bootloader (`0483:df11`) as the fallback.
@@ -531,10 +806,17 @@ scripts/build.sh upload.sh monitor.sh CLI mirror of the IDE build, upload, termi
 scripts/upload-swd.sh                 flash over ST-Link / STLINK-V3 SWD (J10), app at 0x08040000
 scripts/soak.py                       100 KB round-trip integrity + rate check (adapter TX->RX shorted)
 scripts/cdc64-sweep.py                byte-exact sweep at the 64-byte boundary; select-bounded
-                                      reads so a held tail reports INCOMPLETE, not a hang
+                                      reads so a held tail reports INCOMPLETE, not a hang, and
+                                      an intact payload with an extra tail prints that byte
 scripts/mps-tail-probe.py             per-size verdict at the boundary: exact / held tail /
-                                      lost. Writes one release byte and drains, so a held
-                                      tail cannot leak into the next size's read
+                                      lost / whole +k. Writes one release byte and drains, so
+                                      a held tail cannot leak into the next size's read
+scripts/hold-probe.py                 one payload, nothing else for N s: separates a withheld
+                                      transfer end (never arrives) from a late or lost packet
+scripts/fifo-hold-probe.py            hold one payload open and read the class's delivery log
+                                      and the terminal's own TX buffer over SWD inside the
+                                      hold: the class delivered every byte and the terminal
+                                      staged all of it, so the −64 is neither of them
 scripts/usbmon-bulk.py                usbmon decoder for CDC BULK endpoints (the shared
                                       skill's decoder filters to interrupt URBs and sees 0)
 scripts/cynthion-window.py            marks the arm/stop boundaries for an inline Cynthion
@@ -611,7 +893,7 @@ $XP/bin/openocd -s $XP/openocd/scripts -f interface/stlink.cfg -f target/stm32h7
 
 ## Verifying on hardware
 
-1. `scripts/build.sh` — expect 164288 / 70176 bytes.
+1. `scripts/build.sh` — expect 164352 / 70176 bytes.
 2. Flash (`scripts/upload.sh`, or `scripts/upload-swd.sh` when the app or DFU
    is not cooperating), then `scripts/monitor.sh`.
 3. Expect, in order:
@@ -648,6 +930,9 @@ $XP/bin/openocd -s $XP/openocd/scripts -f interface/stlink.cfg -f target/stm32h7
    as `CDC` and the −64 reproduces with the same signature, so the Adafruit
    library was never the variable. The boundary table for this device is the
    parity rule above: 1..16 packets, odd counts 64 short, even counts exact.
+   **Superseded once the split landed:** the same device returns 16/16 exact
+   over 64..1024 and 7/7 across the boundary sweep, so the −64 is no longer
+   observable here — see the workaround bullet.
    **Second FTDI variant verified: `0403:6015`, an FT-X series chip** (`bcdDevice
    0x1000`, device-descriptor `bMaxPacketSize0 = 8` rather than 64). It mounts as
    `FTDI`, is exact across the 63/64/65/128/130/192/193 sweep, and a 200,000-byte
@@ -674,7 +959,17 @@ $XP/bin/openocd -s $XP/openocd/scripts -f interface/stlink.cfg -f target/stm32h7
    needs the re-init). Measured on two types: the CP2104, and separately an
    FTDI FT232R (`0403:6001`) whose table after the replug was identical to a
    cold mount (flags `0x07`, `hostReady = 1`, `configStage = 4`) and which
-   round-tripped 128 bytes — a whole number of packets — exact.
+   round-tripped 128 bytes — a whole number of packets — exact. Re-measured on
+   the CP2104 with the split landed: pull, 5 s, replug, then 7/7 exact across
+   the boundary sweep with no board reset, and the table after the replug is
+   identical to a cold mount — `_usbh_devices` VID `10c4` PID `ea60` flags
+   `0x07`, `cdch_data[0].serial_drid = 2` = `SERIAL_DRIVER_CP210X`,
+   `hostReady = 1`, `configStage = 4`. Read over an **unhalted** OpenOCD
+   session, which is also how the mount lines were not disturbed. A tty read
+   aimed right at a replug shows nothing: the mount lines print only after the
+   1 s settle plus enumeration, and the sweep's per-size `drain()` then
+   discards them, so an empty console there is an artifact, not a missed
+   event.
 7. Re-reset check: reset over SWD, open the port 3 s later, read 15 s — one
    `mounted` and one `ready`, nothing else (this is the mount-storm regression
    test).

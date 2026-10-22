@@ -9,7 +9,9 @@
 #   - arduino:mbed_giga core 4.6.0 (FQBN arduino:mbed_giga:giga, DFU upload at
 #     0x08040000, 1966080 B app / 523624 B heap)
 #   - TinyUSB_Arduino 1.0.0 (~/TinyUSB_Arduino, union config as shipped:
-#     CFG_TUH_CDC + FTDI + PL2303 + CP210X + CH34X all 1)
+#     CFG_TUH_CDC + FTDI + PL2303 + CP210X + CH34X all 1;
+#     CFG_TUH_CDC_CP210X_SUPPRESS_ZLP defaults to 1 in tusb_option.h, so the
+#     host-TX ZLP is not sent for CP210x — see AGENTS.md)
 #
 # The IDE resolves the library from the sketchbook, not from here: run
 # scripts/install-library.sh once, or add the library through

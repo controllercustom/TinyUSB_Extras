@@ -39,6 +39,11 @@
 #define HOST_DUMMY_BAUD   1200
 #define BRIDGE_BUF_SIZE   256
 
+// The USB-C terminal's bulk IN packet size. Mbed declares it as
+// CDC_MAX_PACKET_SIZE (USBCDC.h:30-32: 512 only under USE_USB_OTG_HS, 64
+// otherwise) and the wire confirms 64 on this bench.
+#define TERMINAL_MPS      64
+
 static uint8_t hostIdx = 0;
 static bool hostReady = false;
 static const char *hostTypeName = "unknown";
@@ -270,6 +275,31 @@ static void runConfigChain(void)
 // Bridge
 // ---------------------------------------------------------------------------
 
+// Never hand the terminal a transfer that is a whole number of MPS packets.
+// The PC's cdc_acm arms 128-byte IN URBs (cdc-acm.c:1388-1389: readsize =
+// 2 * MPS) and a bulk IN packet of exactly MPS does not complete one, so a
+// whole-MPS tail is withheld until the next write. Split so the burst ends
+// short. flush() is not cosmetic: send_nb no-ops while _tx_in_progress
+// (USBCDC.cpp:377-393), so without it the tail byte can be appended to the
+// still-open buffer and go out as one whole-MPS packet.
+static void writeTerminal(const uint8_t *buf, uint32_t n)
+{
+  if (n == 0)
+  {
+    return;
+  }
+
+  if ((n % TERMINAL_MPS) != 0)
+  {
+    Serial.write(buf, n);
+    return;
+  }
+
+  Serial.write(buf, n - 1);
+  Serial.flush();
+  Serial.write(buf + n - 1, 1);
+}
+
 static void bridgeHostToTerminal(void)
 {
   uint8_t buf[BRIDGE_BUF_SIZE];
@@ -285,7 +315,7 @@ static void bridgeHostToTerminal(void)
 
   if (count > 0)
   {
-    Serial.write(buf, count);
+    writeTerminal(buf, count);
   }
 }
 

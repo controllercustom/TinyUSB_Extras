@@ -75,7 +75,11 @@ for n in SIZES:
           f"{'exact' if exact else 'MISMATCH'}")
 
     if not exact:
-        if got == blob[:len(got)]:
+        if len(got) > n and got[:n] == blob:
+            # Payload intact with the spurious byte appended: the +1 case, where
+            # every index matches and only the tail is extra.
+            kind = f"{len(got) - n} extra bytes {got[n:].hex(' ')}"
+        elif got == blob[:len(got)]:
             kind = (f"{n - len(got)} short (held tail)" if len(got) < n
                     else f"{len(got) - n} extra bytes {got[n:].hex(' ')}")
         else:

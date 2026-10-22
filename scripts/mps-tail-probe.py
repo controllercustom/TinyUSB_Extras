@@ -17,6 +17,9 @@ For each N it classifies:
   exact        all N bytes arrived on their own
   held tail    N-k missing, and they arrive once one more byte is written
   lost         N-k missing and still absent after the release byte
+  whole +k     all N arrived plus k bytes the device invented — measured on the
+               CP2104, whose firmware answers the host-TX ZLP with one stale
+               byte; a byte-counting consumer sees COUNT+k
 """
 
 import os
@@ -72,28 +75,33 @@ for n in SIZES:
     while written < n:
         written += os.write(fd, blob[written:written + 4096])
     got = read(n, READ_S)
+    own = len(got)
 
     if got == blob:
         verdict = "exact"
+        missing = 0
+    elif own > n and got[:n] == blob:
+        # The payload is whole and longer than what was sent: the device
+        # invented bytes. Measured on the CP2104, whose firmware answers the
+        # host-TX ZLP (cdc_host.c:683-686) with one stale byte of its own.
+        verdict = f"whole + {own - n} spurious"
         missing = 0
     else:
         # One more byte is what releases a held tail; the release byte echoes
         # too, so expect missing + 1 bytes back.
         release = bytes([0xEE])
         os.write(fd, release)
-        more = read(n - len(got) + 1, READ_S)
+        more = read(n - own + 1, READ_S)
         tail = more[:len(more) - 1] if len(more) else b""
         if got + tail == blob:
             verdict = "held tail (released by the next byte)"
-            missing = n - len(got)
         else:
             verdict = "lost / not recoverable"
-            missing = n - len(got)
+        missing = n - own
         got = got + tail
 
     rate = len(got) / max(time.time() - t0, 0.001)
-    print(f"{n:6d} bytes ({n // 64} pkts) -> {len(got) if got == blob else n - missing}"
-          f" on their own  [{verdict}]"
+    print(f"{n:6d} bytes ({n // 64} pkts) -> {own} on their own  [{verdict}]"
           + (f"  rate={rate / 1024:.0f} KiB/s" if verdict == "exact" else ""))
     results.append((n, verdict, missing))
 
